@@ -1,0 +1,367 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Criar arquivos do app
+        run: |
+          mkdir -p app/src/main/java/com/modoinvestidor/favoritos
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.modoinvestidor.favoritos"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.modoinvestidor.favoritos"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-core")
+              implementation("io.coil-kt:coil-compose:2.6.0")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="Favoritos"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/modoinvestidor/favoritos/MainActivity.kt <<'EOF'
+          package com.modoinvestidor.favoritos
+
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.ExperimentalFoundationApi
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Add
+          import androidx.compose.material.icons.filled.Delete
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.runtime.snapshots.SnapshotStateList
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.core.text.HtmlCompat
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          data class Bookmark(
+              val id: Long,
+              val url: String,
+              val title: String,
+              val thumb: String?,
+              val tag: String,
+              val isVideo: Boolean
+          )
+
+          object Meta {
+              private val videoHosts = listOf(
+                  "youtube.com", "youtu.be", "vimeo.com", "tiktok.com",
+                  "instagram.com", "twitch.tv", "dailymotion.com"
+              )
+
+              fun host(url: String) = Uri.parse(url).host?.removePrefix("www.") ?: url
+
+              fun isVideo(url: String): Boolean {
+                  val h = Uri.parse(url).host?.lowercase() ?: return false
+                  return videoHosts.any { h == it || h.endsWith(".$it") }
+              }
+
+              private fun get(url: String): String {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.connectTimeout = 8000
+                  c.readTimeout = 8000
+                  c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) Chrome/120 Mobile")
+                  return c.inputStream.bufferedReader().use { r ->
+                      val buf = CharArray(200_000)
+                      val n = r.read(buf)
+                      if (n > 0) String(buf, 0, n) else ""
+                  }
+              }
+
+              private fun content(html: String, prop: String): String? {
+                  val a = Regex("<meta[^>]+(?:property|name)=[\"']$prop[\"'][^>]+content=[\"']([^\"']*)[\"']", RegexOption.IGNORE_CASE)
+                  val b = Regex("<meta[^>]+content=[\"']([^\"']*)[\"'][^>]+(?:property|name)=[\"']$prop[\"']", RegexOption.IGNORE_CASE)
+                  return (a.find(html) ?: b.find(html))?.groupValues?.get(1)
+              }
+
+              private fun clean(s: String?) =
+                  s?.let { HtmlCompat.fromHtml(it, HtmlCompat.FROM_HTML_MODE_LEGACY).toString().trim() }
+                      ?.takeIf { it.isNotBlank() }
+
+              /** Retorna (título, miniatura) */
+              fun fetch(url: String): Pair<String?, String?> = try {
+                  val h = host(url)
+                  if (h.contains("youtube.com") || h.contains("youtu.be")) {
+                      val j = JSONObject(get("https://www.youtube.com/oembed?format=json&url=" + URLEncoder.encode(url, "UTF-8")))
+                      clean(j.optString("title")) to j.optString("thumbnail_url").ifBlank { null }
+                  } else {
+                      val html = get(url)
+                      val title = clean(content(html, "og:title"))
+                          ?: clean(Regex("<title[^>]*>([^<]*)</title>", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1))
+                      title to content(html, "og:image")
+                  }
+              } catch (e: Exception) {
+                  null to null
+              }
+          }
+
+          class Store(ctx: Context) {
+              private val prefs = ctx.getSharedPreferences("favoritos", Context.MODE_PRIVATE)
+              val items: SnapshotStateList<Bookmark> = mutableStateListOf()
+              private val scope = CoroutineScope(Dispatchers.IO)
+
+              init {
+                  val arr = JSONArray(prefs.getString("items", "[]"))
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      items.add(
+                          Bookmark(
+                              o.getLong("id"), o.getString("url"), o.getString("title"),
+                              o.optString("thumb").ifBlank { null }, o.optString("tag"), o.optBoolean("video")
+                          )
+                      )
+                  }
+              }
+
+              private fun save() {
+                  val arr = JSONArray()
+                  items.forEach {
+                      arr.put(JSONObject().put("id", it.id).put("url", it.url).put("title", it.title)
+                          .put("thumb", it.thumb ?: "").put("tag", it.tag).put("video", it.isVideo))
+                  }
+                  prefs.edit().putString("items", arr.toString()).apply()
+              }
+
+              fun add(rawUrl: String, tag: String): Boolean {
+                  var url = rawUrl.trim()
+                  if (url.isBlank()) return false
+                  if (!url.startsWith("http")) url = "https://$url"
+                  if (items.any { it.url == url }) return false
+                  val b = Bookmark(System.currentTimeMillis(), url, Meta.host(url), null, tag.trim(), Meta.isVideo(url))
+                  items.add(0, b)
+                  save()
+                  scope.launch {
+                      val (title, thumb) = Meta.fetch(url)
+                      withContext(Dispatchers.Main) {
+                          val i = items.indexOfFirst { it.id == b.id }
+                          if (i >= 0) {
+                              items[i] = items[i].copy(title = title ?: items[i].title, thumb = thumb)
+                              save()
+                          }
+                      }
+                  }
+                  return true
+              }
+
+              fun remove(b: Bookmark) {
+                  items.remove(b)
+                  save()
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              private lateinit var store: Store
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  store = Store(this)
+                  handleShare(intent)
+                  setContent { MaterialTheme { App(store) } }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handleShare(intent)
+              }
+
+              private fun handleShare(i: Intent?) {
+                  if (i?.action != Intent.ACTION_SEND) return
+                  val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
+                  val link = Regex("https?://\\S+").find(text)?.value ?: return
+                  val ok = store.add(link, "")
+                  Toast.makeText(this, if (ok) "Salvo!" else "Já estava salvo", Toast.LENGTH_SHORT).show()
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+          @Composable
+          fun App(store: Store) {
+              val ctx = LocalContext.current
+              var query by remember { mutableStateOf("") }
+              var filter by remember { mutableStateOf("Todos") }
+              var showAdd by remember { mutableStateOf(false) }
+
+              val tags = store.items.map { it.tag }.filter { it.isNotBlank() }.distinct()
+              val filters = listOf("Todos", "Vídeos", "Sites") + tags
+              val shown = store.items.filter { b ->
+                  val okFilter = when (filter) {
+                      "Todos" -> true
+                      "Vídeos" -> b.isVideo
+                      "Sites" -> !b.isVideo
+                      else -> b.tag == filter
+                  }
+                  val q = query.trim()
+                  okFilter && (q.isEmpty() || b.title.contains(q, true) || b.url.contains(q, true) || b.tag.contains(q, true))
+              }
+
+              Scaffold(
+                  topBar = { TopAppBar(title = { Text("Favoritos") }) },
+                  floatingActionButton = {
+                      FloatingActionButton(onClick = { showAdd = true }) { Icon(Icons.Default.Add, "Adicionar") }
+                  }
+              ) { pad ->
+                  Column(Modifier.padding(pad).padding(horizontal = 12.dp)) {
+                      OutlinedTextField(
+                          value = query, onValueChange = { query = it },
+                          label = { Text("Buscar") }, singleLine = true,
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      LazyRow(
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                          modifier = Modifier.padding(vertical = 8.dp)
+                      ) {
+                          items(filters) { f ->
+                              FilterChip(selected = filter == f, onClick = { filter = f }, label = { Text(f) })
+                          }
+                      }
+                      if (shown.isEmpty()) {
+                          Text("Nada por aqui. Toque em + ou compartilhe um link de outro app para este.",
+                              modifier = Modifier.padding(16.dp))
+                      }
+                      LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          items(shown, key = { it.id }) { b ->
+                              Card(
+                                  Modifier.fillMaxWidth().clickable {
+                                      ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(b.url)))
+                                  }
+                              ) {
+                                  Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                      if (b.thumb != null) {
+                                          AsyncImage(
+                                              model = b.thumb, contentDescription = null,
+                                              contentScale = ContentScale.Crop,
+                                              modifier = Modifier.size(96.dp, 64.dp).clip(RoundedCornerShape(8.dp))
+                                          )
+                                          Spacer(Modifier.width(10.dp))
+                                      }
+                                      Column(Modifier.weight(1f)) {
+                                          Text(b.title, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                              style = MaterialTheme.typography.titleSmall)
+                                          Text(
+                                              (if (b.isVideo) "▶ " else "") + Meta.host(b.url) +
+                                                  (if (b.tag.isNotBlank()) "  •  #${b.tag}" else ""),
+                                              style = MaterialTheme.typography.bodySmall
+                                          )
+                                      }
+                                      IconButton(onClick = { store.remove(b) }) {
+                                          Icon(Icons.Default.Delete, "Excluir")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              if (showAdd) {
+                  var url by remember { mutableStateOf("") }
+                  var tag by remember { mutableStateOf("") }
+                  AlertDialog(
+                      onDismissRequest = { showAdd = false },
+                      title = { Text("Novo favorito") },
+                      text = {
+                          Column {
+                              OutlinedTextField(url, { url = it }, label = { Text("Link") }, singleLine = true)
+                              Spacer(Modifier.height(8.dp))
+                              OutlinedTextField(tag, { tag = it }, label = { Text("Tag (opcional)") }, singleLine = true)
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(onClick = { store.add(url, tag); showAdd = false }) { Text("Salvar") }
+                      },
+                      dismissButton = { TextButton(onClick = { showAdd = false }) { Text("Cancelar") } }
+                  )
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: favoritos-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
